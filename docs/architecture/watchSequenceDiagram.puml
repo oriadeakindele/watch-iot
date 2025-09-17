@@ -1,0 +1,224 @@
+@startuml
+' =======================
+' PARTICIPANTS / SERVICES
+' =======================
+actor User
+participant Frontend
+participant AuthService
+participant TenantService
+database DB as "Postgres"
+participant DeviceService
+participant RuleEngine
+participant SubscriptionService
+participant PaymentService
+participant NotificationService
+participant MQTTBroker
+participant Prometheus
+participant Grafana
+participant ESP32 as "Device"
+participant PSP as "Payment Provider\n(Paystack/Flutterwave/etc.)"
+participant CleanupJob as "Cleanup Worker (cron/queue)"
+
+' =======================
+' AUTH & TENANCY — SIGNUP COLLECTS EMAIL + TENANT NAME
+' =======================
+== Registration (Email + Tenant Company/Name) ==
+User -> Frontend: Sign up { email, tenantName?, timezone, locale, intent=create|join }
+Frontend -> AuthService: CreateAuthChallenge(email, purpose="verify_email")
+AuthService -> DB: INSERT auth_challenges(code_hash, code_salt, email, expires_at)
+DB --> AuthService: challenge saved
+AuthService --> Frontend: challenge_id (masked), next_step=Verify Code
+
+group Pre-provision intent
+Frontend -> AuthService: PreProvisionIntent(intent, tenantName?, email, timezone, locale)
+alt intent == "create" (first user will be owner)
+  AuthService -> TenantService: CreateTenant(name, email, timezone, locale, status="pending", owner_user_id=NULL, owner_pending_user_id=NULL)
+  TenantService -> DB: INSERT tenants(..., status="pending", owner_user_id=NULL, owner_pending_user_id=NULL)
+  DB --> TenantService: tenant_id
+  TenantService --> AuthService: tenant_id
+  AuthService -> DB: INSERT pending_users(tenant_id, name, email, enabled=true, expires_at)
+  DB --> AuthService: pending_user_id
+  AuthService -> DB: UPDATE tenants SET owner_pending_user_id=pending_user_id WHERE id=tenant_id
+  DB --> AuthService: ok
+else intent == "join" (joining existing tenant)
+  AuthService -> DB: INSERT pending_users(tenant_id, name, email, enabled=true, expires_at)
+  DB --> AuthService: pending_user_id
+end
+end
+
+group Verification
+User -> Frontend: Submit verification code
+Frontend -> AuthService: VerifyAuthChallenge(challenge_id, code)
+AuthService -> DB: SELECT auth_challenges + checks
+DB --> AuthService: challenge valid?
+
+alt Code valid
+  AuthService -> DB: BEGIN
+  alt intent == "create" (owner promotion)
+    AuthService -> DB: INSERT users(tenant_id, name=full_name, email, enabled=true) RETURNING user_id
+    DB --> AuthService: user_id
+    AuthService -> DB: UPDATE tenants SET owner_user_id=user_id, status="active", owner_pending_user_id=NULL WHERE id=tenant_id
+    DB --> AuthService: ok
+    AuthService -> DB: DELETE FROM pending_users WHERE id = (SELECT owner_pending_user_id FROM tenants WHERE id=tenant_id)
+    DB --> AuthService: deleted
+  else intent == "join" (regular member)
+    AuthService -> DB: INSERT users(tenant_id, name, email, enabled=true) RETURNING user_id
+    DB --> AuthService: user_id
+    AuthService -> DB: DELETE FROM pending_users WHERE tenant_id=tenant_id AND email=email
+    DB --> AuthService: deleted
+  end
+  AuthService -> DB: INSERT sessions(user_id, tenant_id, refresh_token_hash, expires_at)
+  DB --> AuthService: session created
+  AuthService -> DB: COMMIT
+  AuthService --> Frontend: JWT + refresh token
+else Code invalid/expired
+  AuthService --> Frontend: 4xx error
+end
+end
+
+' =======================
+' LOGIN (unchanged)
+' =======================
+== Login ==
+User -> Frontend: Login (email + code/cred)
+Frontend -> AuthService: Authenticate(email, code/cred)
+AuthService -> DB: Validate users/auth_challenges
+DB --> AuthService: ok
+AuthService -> DB: INSERT sessions(...)
+DB --> AuthService: session
+AuthService --> Frontend: JWT / Session Token
+
+' =======================
+' LOCATION / DEVICE REGISTRY & ASSIGNMENTS
+' =======================
+== Location & Device Setup ==
+User -> Frontend: Create Location
+Frontend -> DeviceService: CreateLocation(tenant_id, locationData)
+DeviceService -> DB: INSERT locations(tenant_id, ...)
+DB --> DeviceService: Location Saved
+DeviceService --> Frontend: location_id
+
+User -> Frontend: Add Device under Location
+Frontend -> DeviceService: RegisterDevice(tenant_id, location_id, deviceData)
+DeviceService -> DB: INSERT devices(tenant_id, location_id, name, status, metadata)
+DB --> DeviceService: Device Saved
+DeviceService --> Frontend: device_id
+
+User -> Frontend: Assign members
+Frontend -> DeviceService: AddUserToLocation(tenant_id, location_id, user_id, role)
+DeviceService -> DB: UPSERT location_users(...)
+DB --> DeviceService: ok
+Frontend -> DeviceService: AddUserToDevice(tenant_id, device_id, user_id, role)
+DeviceService -> DB: UPSERT device_users(...)
+DB --> DeviceService: ok
+
+' =======================
+' PLANS / SUBSCRIPTIONS / PAYMENTS
+' =======================
+== Subscription ==
+User -> Frontend: Subscribe device to plan
+Frontend -> SubscriptionService: CreateSubscription(tenant_id, device_id, plan_code)
+SubscriptionService -> DB: SELECT plans WHERE (tenant_id, code)
+DB --> SubscriptionService: plan(price, duration_days)
+SubscriptionService -> DB: INSERT payments(tenant_id, payment_type=device_subscription, amount, currency, provider, idempotency_key, status="pending")
+DB --> SubscriptionService: payment_id
+
+SubscriptionService -> PaymentService: Charge(tenant_id, payment_id)
+PaymentService -> PSP: Create/Confirm Payment
+PSP --> PaymentService: success(provider_ref)
+PaymentService -> DB: UPDATE payments SET status="completed", provider_ref, paid_at=now()
+DB --> PaymentService: ok
+
+PaymentService -> SubscriptionService: PaymentSuccess(payment_id)
+SubscriptionService -> DB: INSERT/UPSERT device_subscriptions(..., status="active")
+DB --> SubscriptionService: active
+SubscriptionService -> NotificationService: Notify(type=subscriptionExpiry, msg)
+NotificationService -> DB: INSERT notifications(status="pending", type="subscriptionExpiry", ...)
+DB --> NotificationService: notif_id
+
+' =======================
+' TELEMETRY / RULES / ALERTS
+' =======================
+== Telemetry ==
+ESP32 -> MQTTBroker: Publish Telemetry {ts, voltage, current, power, level, temp}
+MQTTBroker -> DeviceService: Forward Telemetry(tenant_id, device_id, payload)
+DeviceService -> DB: INSERT device_readings(...)  ' Timescale hypertable
+DB --> DeviceService: inserted
+DeviceService -> DB: UPSERT latest_by_device(...)
+DB --> DeviceService: upserted
+
+DeviceService -> RuleEngine: EvaluateRules(tenant_id, device_id, latest metrics)
+RuleEngine -> DB: SELECT rules WHERE tenant_id AND enabled AND scope matches
+DB --> RuleEngine: rules
+RuleEngine -> RuleEngine: Evaluate (operator/threshold/windowSec)
+alt Threshold Crossed
+  RuleEngine -> DB: INSERT alerts(..., status="open")
+  DB --> RuleEngine: alert_id
+  RuleEngine -> NotificationService: Enqueue(threshold alert)
+  NotificationService -> DB: INSERT notifications(type="threshold", status="pending", ...)
+  DB --> NotificationService: notification_id
+  NotificationService -> DB: INSERT sent_log(alert_id, notification_id)
+  DB --> NotificationService: logged
+end
+
+DeviceService -> Prometheus: Expose /metrics
+Prometheus -> DeviceService: Scrape
+Grafana -> Prometheus: PromQL
+Prometheus --> Grafana: Metrics
+
+' =======================
+' NOTIFICATIONS
+' =======================
+== Notification Delivery ==
+NotificationService -> NotificationService: Fanout (email/push/SMS)
+NotificationService -> DB: UPDATE notifications SET status="sent"
+DB --> NotificationService: ok
+
+User -> Frontend: Open notifications
+Frontend -> NotificationService: MarkAsRead(notification_id)
+NotificationService -> DB: UPDATE notifications SET status="read"
+DB --> NotificationService: ok
+
+' =======================
+' DASHBOARD
+' =======================
+== Dashboard ==
+User -> Frontend: View Dashboard
+Frontend -> Grafana: Request Panels
+Grafana --> Frontend: Rendered Metrics
+
+Frontend -> DeviceService: Fetch latest + alerts + daily aggregates
+DeviceService -> DB: SELECT latest_by_device, alerts(status="open"), daily_alerts(dt range)
+DB --> DeviceService: datasets
+DeviceService --> Frontend: JSON
+
+' =======================
+' SESSION LIFECYCLE
+' =======================
+== Refresh / Revoke ==
+Frontend -> AuthService: Refresh(refresh_token)
+AuthService -> DB: SELECT sessions (valid & not revoked)
+DB --> AuthService: ok
+AuthService -> DB: INSERT/UPDATE sessions (rotate)
+DB --> AuthService: ok
+AuthService --> Frontend: new JWT
+
+User -> Frontend: Logout
+Frontend -> AuthService: RevokeSession(session_id)
+AuthService -> DB: UPDATE sessions SET revoked_at=now()
+DB --> AuthService: ok
+AuthService --> Frontend: done
+
+' =======================
+' CLEANUP (expiry handling)
+' =======================
+== Pending Cleanup ==
+CleanupJob -> DB: SELECT * FROM pending_users WHERE now() > expires_at
+alt pending user is OWNER of a PENDING tenant
+  CleanupJob -> DB: DELETE FROM tenants WHERE id = pending_users.tenant_id
+  DB --> CleanupJob: tenant and pending users deleted
+else pending user is a JOINER (non-owner)
+  CleanupJob -> DB: DELETE FROM pending_users WHERE id = pending_users.id
+  DB --> CleanupJob: pending user deleted
+end
+@enduml
