@@ -1,0 +1,19 @@
+packages:
+  # All microservices
+  - "auth"
+  - "device"
+  - "ingest"
+  - "telemetry"
+  - "alerts"
+  - "notifications"
+  - "payments"
+  - "api-gateway"
+
+  # Apps folder (if you later add more under apps/)
+  - "apps/*"
+
+  # Shared libraries
+  - "libs/*"
+
+  # Simulators
+  - "simulators/*"
