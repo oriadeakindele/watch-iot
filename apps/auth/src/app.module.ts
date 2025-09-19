@@ -1,7 +1,6 @@
 import { Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 import * as Joi from "joi";
-import { HealthController } from "./health.controller";
 
 @Module({
   imports: [
@@ -18,7 +17,7 @@ import { HealthController } from "./health.controller";
     }),
     // Later you’ll add AuthModule, UsersModule, DatabaseModule, etc.
   ],
-  controllers: [HealthController],
+  controllers: [],
   providers: [],
 })
 export class AppModule {}
