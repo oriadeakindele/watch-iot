@@ -1,8 +1,8 @@
 // src/composition-root.ts
 import { Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
-import envConfig from "./infrastructure/config/.env.config";
-import { validateEnv } from "./infrastructure/config/.env.validation";
+import envConfig from "./infrastructure/config/env.config";
+import { validateEnv } from "./infrastructure/config/env.validation";
 import { AuthController } from "./infrastructure/http/controllers/auth.controller";
 import { TenantsController } from "./infrastructure/http/controllers/tenant.controller";
 
