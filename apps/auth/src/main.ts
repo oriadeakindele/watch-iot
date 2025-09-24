@@ -7,6 +7,8 @@ async function bootstrap() {
   app.enableCors();
   app.setGlobalPrefix("api");
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
-  await app.listen(process.env.AUTH_PORT ?? 3001);
+  const port = process.env.PORT ? Number(process.env.AUTH_PORT) : 3001;
+  await app.listen(port);
+  console.log(`Watch-IoT listening on http://localhost:${port}`);
 }
 bootstrap();
